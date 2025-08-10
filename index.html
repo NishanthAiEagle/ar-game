@@ -1,0 +1,502 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<title>Golden Star AR Scavenger Hunt</title>
+<style>
+  :root{--gold:#ffde59;--bg:rgba(0,0,0,0.35);--text:#fff}
+  html,body{height:100%;margin:0;background:#000;font-family:Inter,system-ui,Arial}
+  #app{position:fixed;inset:0;overflow:hidden}
+  #enterAR{position:absolute;left:50%;top:18px;transform:translateX(-50%);z-index:50;padding:10px 16px;border-radius:10px;background:linear-gradient(90deg,#1f2937,#111827);color:white;border:1px solid rgba(255,255,255,0.06)}
+  #hud{position:fixed;left:12px;top:12px;z-index:50;color:var(--text);background:var(--bg);padding:10px;border-radius:10px}
+  #scores{position:fixed;right:12px;top:12px;z-index:50;color:var(--text);background:var(--bg);padding:10px;border-radius:10px;text-align:right}
+  #message{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:60;background:rgba(0,0,0,0.6);padding:18px;border-radius:12px;color:white;display:none}
+  #resultPanel{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:70;background:rgba(0,0,0,0.7);padding:18px;border-radius:12px;color:white;display:none;min-width:220px;text-align:center}
+  button{cursor:pointer;border-radius:8px;padding:8px 12px;border:none;background:#111;color:#fff}
+  #threeCanvas{position:fixed;inset:0;width:100%;height:100%;z-index:0;touch-action:none}
+  .pill{background:rgba(255,255,255,0.04);padding:6px 10px;border-radius:999px}
+  .small{font-size:13px;opacity:.95}
+  a.link{color:var(--gold);text-decoration:underline}
+</style>
+</head>
+<body>
+  <div id="app">
+    <button id="enterAR">Enter AR</button>
+    <div id="hud"><div class="small">Time left: <span id="timeLeft">60</span>s</div></div>
+    <div id="scores">
+      <div class="small">Gold: <span id="goldScore">0</span>%</div>
+      <div class="small">Diamond: <span id="diamondScore">0</span>%</div>
+      <div class="small">Silver: <span id="silverScore">0</span>%</div>
+    </div>
+
+    <canvas id="threeCanvas"></canvas>
+
+    <div id="resultPanel">
+      <h3>Round Complete</h3>
+      <div>Gold Discount: <b id="goldFinal">0</b>%</div>
+      <div>Diamond Discount: <b id="diamondFinal">0</b>%</div>
+      <div>Silver Discount: <b id="silverFinal">0</b>%</div>
+      <div style="height:8px"></div>
+      <button id="screenshotBtn">📸 Take Screenshot</button>
+      <button id="shareBtn" style="display:none;margin-left:8px">🔗 Share</button>
+    </div>
+
+    <div id="message"></div>
+  </div>
+
+  <!-- three.js -->
+  <script src="https://cdn.jsdelivr.net/npm/three@0.158.0/build/three.min.js"></script>
+
+  <script>
+  // SINGLE-FILE WebXR AR Sparkle Hunt
+  // - Place index.html in GitHub Pages root
+  // - Folders: gold/1.jpg..10.jpg  diamond/1.jpg..10.jpg  silver/1.jpg..10.jpg
+  // - Best on Android Chrome with WebXR + Hit Test support
+  (async function(){
+    // ---- config ----
+    const ROUND_TIME = 60; // seconds
+    const MAX_DISCOUNT = 50;
+    const IMAGES_PER_CAT = 10;
+    const categories = ['gold','diamond','silver'];
+    const canvas = document.getElementById('threeCanvas');
+    const enterARBtn = document.getElementById('enterAR');
+    const timeLeftEl = document.getElementById('timeLeft');
+    const goldScoreEl = document.getElementById('goldScore');
+    const diamondScoreEl = document.getElementById('diamondScore');
+    const silverScoreEl = document.getElementById('silverScore');
+    const messageEl = document.getElementById('message');
+    const resultPanel = document.getElementById('resultPanel');
+    const goldFinal = document.getElementById('goldFinal');
+    const diamondFinal = document.getElementById('diamondFinal');
+    const silverFinal = document.getElementById('silverFinal');
+    const screenshotBtn = document.getElementById('screenshotBtn');
+    const shareBtn = document.getElementById('shareBtn');
+
+    let goldPoints=0, diamondPoints=0, silverPoints=0;
+    let timeLeft = ROUND_TIME;
+    let session = null;
+    let xrRefSpace = null;
+    let hitTestSource = null;
+    let running = false;
+    let spinnerSpawnInterval = null;
+
+    // Preload images (30 total)
+    showMessage('Preloading images — please wait a moment...');
+    const images = { gold:[], diamond:[], silver:[] };
+    for(const cat of categories){
+      for(let i=1;i<=IMAGES_PER_CAT;i++){
+        const img = new Image();
+        // try jpg then png fallback
+        img.src = `${cat}/${i}.jpg`;
+        await new Promise(resolve => {
+          img.onload = () => resolve();
+          img.onerror = () => {
+            img.src = `${cat}/${i}.png`;
+            img.onload = () => resolve();
+            img.onerror = () => resolve();
+          };
+        });
+        images[cat].push(img);
+      }
+    }
+    hideMessage();
+
+    // three.js rendering + scene
+    const renderer = new THREE.WebGLRenderer({canvas,alpha:true,antialias:true,preserveDrawingBuffer:true});
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.xr.enabled = true;
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera();
+    // light for image planes / star meshes
+    scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 1.0));
+
+    // star sprite (SVG golden star) texture
+    const starSVG = encodeURIComponent(`
+      <svg xmlns='http://www.w3.org/2000/svg' width='128' height='128'>
+        <polygon points='64,6 77,47 121,47 84,70 98,112 64,86 30,112 44,70 7,47 51,47'
+          fill='#ffde59' stroke='rgba(255,255,255,0.9)' stroke-width='4'/>
+      </svg>`);
+    const starTex = new THREE.TextureLoader().load('data:image/svg+xml;utf8,'+starSVG);
+
+    // manage AR objects
+    const arStars = []; // {anchorSpace, mesh, collected}
+    const worldObjects = []; // for raycast (stars + reveal planes)
+
+    // star factory: small 3D plane sprite anchored at XR hit point
+    function createStarAt(xrPose) {
+      const map = starTex;
+      map.encoding = THREE.sRGBEncoding;
+      const material = new THREE.SpriteMaterial({map,transparent:true});
+      const sprite = new THREE.Sprite(material);
+      sprite.scale.set(0.4,0.4,0.4); // size in meters (approx)
+      // position will be set in render loop via anchorTransforms
+      scene.add(sprite);
+      arStars.push({anchorPose: xrPose, mesh: sprite, collected:false});
+      worldObjects.push(sprite);
+    }
+
+    // reveal plane with jewelry image texture
+    function revealAt(positionVec3, cat) {
+      const img = images[cat][Math.floor(Math.random()*images[cat].length)];
+      const tex = new THREE.Texture(img);
+      tex.needsUpdate = true;
+      const geo = new THREE.PlaneGeometry(0.6, 0.6 * (img.height/img.width || 1));
+      const mat = new THREE.MeshBasicMaterial({map:tex,transparent:true});
+      const plane = new THREE.Mesh(geo, mat);
+      plane.position.copy(positionVec3);
+      plane.lookAt(camera.position);
+      scene.add(plane);
+      worldObjects.push(plane);
+      // fade out and remove after 1s
+      const start = performance.now();
+      const duration = 900;
+      (function anim(){
+        const t = Math.min(1,(performance.now()-start)/duration);
+        plane.material.opacity = 1 - t;
+        plane.scale.setScalar(1 + t*0.15);
+        if(t<1) requestAnimationFrame(anim); else {
+          scene.remove(plane);
+          const idx = worldObjects.indexOf(plane); if(idx>=0) worldObjects.splice(idx,1);
+        }
+      })();
+    }
+
+    // handle XR session start
+    async function startXR(){
+      if(!navigator.xr) {
+        showMessage('WebXR not supported on this browser/device. Try Chrome on Android with WebXR enabled.');
+        return;
+      }
+      try {
+        session = await navigator.xr.requestSession('immersive-ar', {
+          requiredFeatures: ['hit-test', 'local-floor'],
+          optionalFeatures: ['dom-overlay','light-estimation'],
+          domOverlay: {root: document.body}
+        });
+      } catch(err) {
+        console.error('XR requestSession failed',err); showMessage('Could not start AR session — permission denied or unsupported.');
+        return;
+      }
+
+      // set renderer XR session
+      renderer.xr.setSession(session);
+      xrRefSpace = await session.requestReferenceSpace('local-floor');
+
+      // hit test source (viewer-based)
+      const viewerSpace = await session.requestReferenceSpace('viewer');
+      try {
+        hitTestSource = await session.requestHitTestSource({space: viewerSpace});
+      } catch (e) {
+        console.warn('hitTestSource request failed', e);
+      }
+
+      // handle select (tap) events from AR input
+      session.addEventListener('select', onXRSelect);
+
+      // end session cleanup
+      session.addEventListener('end', () => {
+        running = false;
+        hitTestSource = null;
+        session = null;
+        clearInterval(spinnerSpawnInterval);
+        showMessage('AR session ended');
+      });
+
+      // begin render loop
+      running = true;
+      animateXR();
+      enterARBtn.style.display = 'none';
+
+      // spawn initial stars every 1.2s using hit test (for a few seconds)
+      spinnerSpawnInterval = setInterval(()=> spawnStarViaHitTest(), 1200);
+      // also spawn a few right away
+      for(let i=0;i<4;i++) spawnStarViaHitTest();
+      // start timer
+      startTimer();
+    }
+
+    // spawn star using hit test to place on a real-world surface in front of user
+    async function spawnStarViaHitTest(){
+      if(!session || !hitTestSource) {
+        // fallback: place in front of camera in local space
+        placeStarInFront(1.8 + Math.random()*1.8);
+        return;
+      }
+      // get a single frame from XR to request pose for hit test
+      const frame = await new Promise(res => session.requestAnimationFrame(() => res(null)));
+      // above doesn't give us frame; instead we will rely on the render loop using latest frame and a flag:
+      // simpler: place small local-space star in front if hit test not immediately available
+      // (spawn will be refined by render loop to follow anchor transform)
+      placeStarInFront(1.8 + Math.random()*1.8);
+    }
+
+    function placeStarInFront(distance=2.5){
+      // create a temporary pose object we will update in render loop: approximate forward vector
+      // store anchorPose as object with offset distance and no real anchor
+      const forwardPose = {fakeDistance: distance, fakeAngle: Math.random()*Math.PI*2};
+      // mesh will be created and will be positioned each frame using camera matrix (approx)
+      const map = starTex;
+      const material = new THREE.SpriteMaterial({map,transparent:true});
+      const sprite = new THREE.Sprite(material);
+      sprite.scale.set(0.45,0.45,0.45);
+      scene.add(sprite);
+      arStars.push({anchorPose: forwardPose, mesh: sprite, collected:false, fake:true});
+      worldObjects.push(sprite);
+    }
+
+    // called when user taps/selects in XR
+    function onXRSelect(evt){
+      // Do a raycast from input source to intersect with sprite meshes
+      // We'll use the input pose to create a Three Raycaster
+      const frame = evt.frame;
+      const inputPose = frame.getPose(evt.inputSource.targetRaySpace, xrRefSpace);
+      if(!inputPose) return;
+      // create a Three.js Ray using the inputPose transform
+      const origin = new THREE.Vector3().fromArray(inputPose.transform.position);
+      const dir = new THREE.Vector3(0,0,-1).applyQuaternion(new THREE.Quaternion().fromArray(inputPose.transform.orientation));
+      const raycaster = new THREE.Raycaster(origin, dir, 0.0, 10.0);
+      const intersects = raycaster.intersectObjects(worldObjects, true);
+      if(intersects.length>0){
+        const hit = intersects[0].object;
+        handleCollect(hit);
+      }
+    }
+
+    // Also allow touch/click on the canvas for non-XR selection (works if dom-overlay available)
+    canvas.addEventListener('click', (ev)=>{
+      if(!running) return;
+      // convert screen point to a ray from camera
+      const x = (ev.clientX / window.innerWidth)*2 - 1;
+      const y = - (ev.clientY / window.innerHeight)*2 + 1;
+      const ray = new THREE.Raycaster();
+      ray.setFromCamera({x,y}, camera);
+      const ints = ray.intersectObjects(worldObjects, true);
+      if(ints.length>0) handleCollect(ints[0].object);
+    });
+
+    function handleCollect(obj){
+      // find nearest star container
+      let starIndex = arStars.findIndex(s => s.mesh === obj || (s.mesh && s.mesh.children && s.mesh.children.includes(obj)));
+      if(starIndex === -1) {
+        // maybe a child (like plane) -> find by distance
+        let best = null; let bestDist=1e9;
+        for(let i=0;i<arStars.length;i++){
+          const s = arStars[i];
+          const d = s.mesh.position.distanceTo(obj.position || new THREE.Vector3());
+          if(d < bestDist){ bestDist=d; best=i; }
+        }
+        if(best !== null) starIndex = best;
+      }
+      if(starIndex === -1) return;
+      const s = arStars[starIndex];
+      if(s.collected) return;
+      s.collected = true;
+      // small animation
+      new TWEEN.Tween({scale: s.mesh.scale.x})
+        .to({scale: s.mesh.scale.x*1.5}, 360)
+        .easing(TWEEN.Easing.Quadratic.Out)
+        .onUpdate(function(){ s.mesh.scale.setScalar(this.scale); })
+        .start();
+
+      // choose random category and award point
+      const cat = categories[Math.floor(Math.random()*categories.length)];
+      const pos = s.mesh.position.clone();
+      revealAt(pos, cat);
+      if(cat==='gold') goldPoints = Math.min(MAX_DISCOUNT, goldPoints+1);
+      if(cat==='diamond') diamondPoints = Math.min(MAX_DISCOUNT, diamondPoints+1);
+      if(cat==='silver') silverPoints = Math.min(MAX_DISCOUNT, silverPoints+1);
+      updateScores();
+
+      // remove star visually
+      setTimeout(()=>{
+        scene.remove(s.mesh);
+        const idx = worldObjects.indexOf(s.mesh); if(idx>=0) worldObjects.splice(idx,1);
+      },220);
+    }
+
+    function updateScores(){
+      goldScoreEl.textContent = goldPoints;
+      diamondScoreEl.textContent = diamondPoints;
+      silverScoreEl.textContent = silverPoints;
+    }
+
+    // start countdown timer
+    let timerInterval = null;
+    function startTimer(){
+      timeLeft = ROUND_TIME;
+      timeLeftEl.textContent = timeLeft;
+      timerInterval = setInterval(()=>{
+        timeLeft--;
+        timeLeftEl.textContent = timeLeft;
+        if(timeLeft<=0){
+          clearInterval(timerInterval);
+          endGame();
+        }
+      },1000);
+    }
+
+    function endGame(){
+      running = false;
+      if(session) session.end();
+      // show results panel
+      goldFinal.textContent = goldPoints;
+      diamondFinal.textContent = diamondPoints;
+      silverFinal.textContent = silverPoints;
+      resultPanel.style.display = 'block';
+      // show instructions to screenshot + share
+      showMessage('Round complete — take screenshot and share your discount!');
+    }
+
+    // feedback helpers
+    function showMessage(str, ms=3000){
+      messageEl.style.display = 'block';
+      messageEl.textContent = str;
+      if(ms>0) setTimeout(()=> hideMessage(), ms);
+    }
+    function hideMessage(){ messageEl.style.display = 'none'; }
+
+    // animation loop for WebXR frames
+    // We'll update fake star positions (placed relative to camera) and render
+    renderer.setAnimationLoop(function(time, frame){
+      // update star anchors: for fake ones, place in front of camera using camera matrix
+      for(const s of arStars){
+        if(s.fake){
+          // position in front at angle offset
+          const camDir = new THREE.Vector3(0,0,-1).applyQuaternion(camera.quaternion);
+          const up = new THREE.Vector3(0,1,0);
+          // create lateral offset perpendicular to forward
+          const lateral = new THREE.Vector3().crossVectors(up, camDir).normalize();
+          const forward = camDir.clone().normalize().multiplyScalar(s.anchorPose.fakeDistance);
+          const lateralOffset = lateral.clone().multiplyScalar(Math.sin(s.anchorPose.fakeAngle)*0.6);
+          const pos = camera.position.clone().add(forward).add(lateralOffset).add(new THREE.Vector3(0,(Math.random()-0.5)*0.3,0));
+          s.mesh.position.copy(pos);
+          s.mesh.lookAt(camera.position);
+        }
+      }
+
+      // If hitTestSource available, try to place new anchors near hit point (one-shot)
+      if(hitTestSource && frame){
+        const hitTestResults = frame.getHitTestResults(hitTestSource);
+        if(hitTestResults.length>0){
+          // use the first hit result to create an anchored star occasionally
+          const hit = hitTestResults[0];
+          const pose = hit.getPose(xrRefSpace);
+          // randomly decide to create an anchored star
+          if(Math.random() < 0.06 && (!arStars.length || arStars.filter(x=>!x.collected).length < 8)){
+            // create anchored sprite at pose
+            const map = starTex;
+            const material = new THREE.SpriteMaterial({map,transparent:true});
+            const sprite = new THREE.Sprite(material);
+            sprite.scale.set(0.45,0.45,0.45);
+            sprite.position.set(pose.transform.position.x, pose.transform.position.y + (Math.random()*0.2), pose.transform.position.z);
+            scene.add(sprite);
+            arStars.push({anchorPose: pose, mesh: sprite, collected:false});
+            worldObjects.push(sprite);
+          }
+        }
+      }
+
+      // optional: simple bobbing for all star sprites
+      const t = performance.now()*0.001;
+      for(const s of arStars){
+        if(s.mesh && !s.collected){
+          s.mesh.position.y += Math.sin(t*4 + s.mesh.position.x)*0.0005;
+        }
+      }
+
+      // update tween library
+      if(window.TWEEN) TWEEN.update();
+
+      renderer.render(scene, camera);
+    });
+
+    // basic resize
+    function onResize(){
+      const w = window.innerWidth, h = window.innerHeight;
+      renderer.setSize(w,h);
+      camera.aspect = w/h; camera.updateProjectionMatrix();
+    }
+    window.addEventListener('resize', onResize);
+    onResize();
+
+    // AR entry
+    enterARBtn.addEventListener('click', async ()=>{
+      // some browsers require a gesture to request permission for device sensors; we already are in click handler
+      await startXR();
+    });
+
+    // screenshot logic (attempts to capture renderer canvas)
+    screenshotBtn.addEventListener('click', async ()=>{
+      try {
+        const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.95));
+        if(!blob) throw new Error('Screenshot failed');
+        const url = URL.createObjectURL(blob);
+        // auto-download
+        const a = document.createElement('a'); a.href=url; a.download = 'sparkle-hunt-result.jpg'; a.click();
+        // show share button
+        shareBtn.style.display = 'inline-block';
+        // store blob url for sharing
+        shareBtn._blobUrl = url;
+        showMessage('Screenshot saved. Tap Share to share your result.');
+      } catch(err){
+        console.error(err);
+        showMessage('Screenshot not available on this browser.');
+      }
+    });
+
+    shareBtn.addEventListener('click', async ()=>{
+      const text = `I earned ${goldPoints}% off Gold, ${diamondPoints}% off Diamond, ${silverPoints}% off Silver!`;
+      if(navigator.canShare && shareBtn._blobUrl){
+        try {
+          const response = await fetch(shareBtn._blobUrl);
+          const blob = await response.blob();
+          const file = new File([blob], 'result.jpg', {type: blob.type});
+          await navigator.share({files:[file], text, title:'My Jewelry Hunt Result'});
+        } catch(e){
+          console.warn('Share failed', e);
+          alert(text);
+        }
+      } else if(navigator.share){
+        try {
+          await navigator.share({text, title:'My Jewelry Hunt Result'});
+        } catch(e){ console.warn(e); }
+      } else {
+        alert(text + '\n\nNo sharing available on this browser; screenshot saved to downloads.');
+      }
+    });
+
+    // small helper: lightweight tween lib (tiny inlined TWEEN) to animate collect scale
+    // Minimal TWEEN v18-like shim for small animations (only required features)
+    (function(){
+      // tiny tween - only used for scale pop
+      function Tween(obj){ this.obj = obj; this._to = {}; this._onUpdate = null; this._easing = function(t){return t}; this._duration = 300; }
+      Tween.prototype.to = function(target,dur){ this._to = target; if(dur) this._duration=dur; return this; };
+      Tween.prototype.easing = function(fn){ this._easing = fn; return this; };
+      Tween.prototype.onUpdate = function(fn){ this._onUpdate = fn; return this; };
+      Tween.prototype.start = function(){ this._start = performance.now(); this._begin = {}; for(let k in this._to) this._begin[k]=this.obj[k]; Tween._list.push(this); };
+      Tween.prototype.update = function(now){ const t = Math.min(1,(now-this._start)/this._duration); const eased = this._easing(t); for(let k in this._to) this.obj[k] = this._begin[k] + (this._to[k]-this._begin[k])*eased; if(this._onUpdate) this._onUpdate.call(this.obj); return t>=1; };
+      Tween._list = [];
+      Tween.updateAll = function(){ const now = performance.now(); for(let i=Tween._list.length-1;i>=0;i--){ if(Tween._list[i].update(now)) Tween._list.splice(i,1); } };
+      window.TWEEN = { Tween: Tween, update: Tween.updateAll, Easing: { Quadratic: { Out: function(k){ return 1 - (1-k)*(1-k); } } } };
+      // convenience
+      window.TWEEN.Tween = function(obj){ return new Tween(obj); };
+    })();
+
+    // final: compatibility check for XR support & hit-test availability
+    if(!navigator.xr){
+      showMessage('WebXR not available in this browser. For full AR try Chrome on Android with "chrome://flags/#webxr" enabled.');
+    } else {
+      // test support for immersive-ar
+      try {
+        const supported = await navigator.xr.isSessionSupported('immersive-ar');
+        if(!supported) {
+          showMessage('This device/browser does not support immersive AR. Try Chrome on Android with WebXR enabled.');
+        }
+      } catch(e){ console.warn(e); }
+    }
+
+  })();
+  </script>
+</body>
+</html>
